@@ -73,12 +73,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.speech_to_text.transcription.serving import (
-    OpenAIServingTranscription,
-)
-from vllm.entrypoints.speech_to_text.translation.serving import (
-    OpenAIServingTranslation,
-)
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -180,6 +174,7 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
+from vllm_omni.entrypoints.openai.serving_transcription import OmniServingTranscription
 from vllm_omni.entrypoints.openai.serving_video import (
     LatentEditInput,
     OmniOpenAIServingVideo,
@@ -217,6 +212,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
     _remove_route_from_router,
     remove_route_from_app,
 )
+from vllm_omni.entrypoints.transcription import SameModelTranscriber
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -551,6 +547,9 @@ async def omni_run_server_worker(
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
+            serving_transcription = getattr(state, "openai_serving_transcription", None) if state is not None else None
+            if serving_transcription is not None:
+                serving_transcription.shutdown()
             sock.close()
 
 
@@ -1175,26 +1174,29 @@ async def omni_init_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
+    transcriber = (
+        SameModelTranscriber(
+            engine_client,
+            engine_client.transcription_stage,
+            {model.name for model in state.openai_serving_models.base_model_paths},
+        )
+        if "transcription" in supported_tasks
+        else None
+    )
+    if state.openai_serving_chat is not None:
+        state.openai_serving_chat.input_audio_transcriber = transcriber
     state.openai_serving_transcription = (
-        OpenAIServingTranscription(
-            engine_client,
+        OmniServingTranscription(
+            transcriber,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
         )
-        if "transcription" in supported_tasks
+        if transcriber is not None
         else None
     )
-    state.openai_serving_translation = (
-        OpenAIServingTranslation(
-            engine_client,
-            state.openai_serving_models,
-            request_logger=request_logger,
-            enable_force_include_usage=args.enable_force_include_usage,
-        )
-        if "transcription" in supported_tasks
-        else None
-    )
+    # Same-model recognition does not qualify translation or its output routing.
+    state.openai_serving_translation = None
     state.anthropic_serving_messages = (
         AnthropicServingMessages(
             engine_client,
