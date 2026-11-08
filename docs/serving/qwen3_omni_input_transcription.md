@@ -17,7 +17,9 @@ WebUI persistence run.
     fix. Automated tests, new-logging syslog checks, and detailed
     language or Open WebUI persistence coverage have not been run here.
     Treat the contracts below as implemented source plus that operator
-    report, not a completed verification suite.
+    report, not a completed verification suite. That report does not
+    validate the later long-recording chunking or named output-voice
+    forwarding.
 
 ## Prerequisites
 
@@ -107,6 +109,94 @@ STT for the client.
 item and earlier history, keeps injected system context, and excludes later
 turns. Assistant `output_audio` and `output_audio_transcript` events are
 unchanged.
+
+## Realtime output voice
+
+Select an existing checkpoint speaker on the same turn-mode Realtime
+session. This does not add a second ASR model, force audio modalities,
+or require an Open WebUI, serving, or dependency upgrade.
+
+Set a session default:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "type": "realtime",
+    "audio": {
+      "output": {
+        "voice": "chelsie"
+      }
+    }
+  }
+}
+```
+
+- A nonempty string is stored after lowercasing and stripping whitespace.
+- A later partial `session.update` that omits `audio.output.voice` keeps
+  the accepted voice.
+- Explicit `voice: null` or a blank string clears it. The model default
+  is then used (Ethan when that name exists on the loaded checkpoint).
+- `session.updated` only acknowledges the stored name. It is not proof
+  that Talker used that speaker token.
+
+A later `response.create` may override for that answer only:
+
+```json
+{
+  "type": "response.create",
+  "response": {
+    "audio": {
+      "output": {
+        "voice": "aiden"
+      }
+    }
+  }
+}
+```
+
+- A valid nonempty response voice wins over the session voice.
+- Null, blank, or omitted response voice uses the session voice and does
+  not clear it.
+- The chosen name is snapshotted for that response. A later session
+  voice change does not retarget an in-flight answer.
+
+Supported names come from the loaded checkpoint, not a global allowlist.
+On the Intel Qwen3-Omni example mapping those names are `chelsie`,
+`ethan`, and `aiden`. Use the checkpoint you actually serve. When the
+checkpoint exposes a nonempty supported-name list, unknown names are
+rejected as `invalid_request_error` with code `invalid_value` and param
+`session.audio.output.voice` or `response.audio.output.voice`, including
+the client event id. If that list is empty, normalized names are
+permitted for compatibility; that is not a guarantee the model supports
+them. A discovery exception logs a warning with traceback and uses the
+same permissive fallback.
+
+A custom non-string voice object is rejected with
+`No voice found with id '...'`, param `voice_id`, and no error code or
+client event id. This fork does not clone voices. If the installed
+server SDK cannot represent custom voice objects, its existing schema
+rejects them before voice validation. Neither a rejected named voice
+nor a rejected custom voice changes accepted session, transcription, or
+VAD settings, or cancels an active response. The connection stays open.
+
+The engine prompt carries list metadata
+`additional_information.speaker`, not a hidden conversation item. With
+DEBUG logging, one generation submit line records the selected name or
+`<model default>`:
+
+`[realtime] generation submission session_id=... request_id=...
+response_id=... speaker=...`
+
+Talker then logs the token it actually used at prefill:
+
+`[talker] speaker=... speaker_token=...`
+
+That Talker line has no request id. Use those DEBUG lines to tell
+acceptance from effective selection. This output-voice path is
+implemented and source-reviewed in this tree; it has not been
+live-synthesized here. The earlier operator report that Realtime voice
+calls work is not a live check of this speaker forwarding.
 
 ## HTTP transcription
 
@@ -285,4 +375,6 @@ while the provider retains the original audio for inference, including
 overlap, tools, and cancellation. That cycle does not require Open WebUI to
 store the original microphone recording. Long committed recordings that
 exceed the loaded model's speech-to-text clip length are implemented in
-this tree; they have not been live-validated here.
+this tree; they have not been live-validated here. Named output-voice
+forwarding is also implemented here; it has not been live-synthesized,
+and that operator voice report does not cover it.

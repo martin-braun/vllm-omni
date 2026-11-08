@@ -60,6 +60,11 @@ from vllm_omni.entrypoints.openai.realtime.session import (
 )
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 
@@ -90,6 +95,16 @@ class _UnsupportedAudioFormatError(ValueError):
     """The Realtime endpoint only accepts mono PCM16 audio at 24 kHz."""
 
 
+class _VoiceValidationError(ValueError):
+    """A voice selection rejected before accepting session or response state."""
+
+    def __init__(self, message: str, *, code: str | None, param: str, client_event: bool = True):
+        super().__init__(message)
+        self.code = code
+        self.param = param
+        self.client_event = client_event
+
+
 @dataclass(slots=True)
 class _ResolvedResponse:
     input: list[types.ConversationItem] | None
@@ -100,6 +115,7 @@ class _ResolvedResponse:
     tool_choice: Any
     metadata: Any
     input_item_id: str | None = None
+    voice: str | None = None
 
 
 class OpenAIFullDuplexConnection:
@@ -120,6 +136,7 @@ class OpenAIFullDuplexConnection:
         self.model_name = model_name
         self.chat_handler = chat_handler
         self._tokenizer = chat_handler.renderer.get_tokenizer()
+        self._supported_speakers = self._load_supported_speakers()
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
         self._vad_backend_provider = vad_backend_provider
         self._turn_detector: ServerTurnDetector | None = None
@@ -246,11 +263,38 @@ class OpenAIFullDuplexConnection:
     #  session.update                                                     #
     # ------------------------------------------------------------------ #
 
+    def _load_supported_speakers(self) -> set[str]:
+        try:
+            hf_config = getattr(self.engine.model_config, "hf_config", None)
+            return get_supported_speakers_from_hf_config(hf_config)
+        except Exception:
+            logger.warning("[realtime] Could not load supported speakers from model config", exc_info=True)
+            return set()
+
+    def _validate_voice(self, voice: Any, param: str) -> str | None:
+        if voice is not None and not isinstance(voice, str):
+            raise _VoiceValidationError(
+                f"No voice found with id '{getattr(voice, 'id', None)}'.",
+                code=None,
+                param="voice_id",
+                client_event=False,
+            )
+        try:
+            return validate_requested_speaker(voice, self._supported_speakers)
+        except ValueError as exc:
+            raise _VoiceValidationError(str(exc), code="invalid_value", param=param) from exc
+
     async def _handle_session_update(self, event: types.SessionUpdateEvent):
         s = self.session
         candidate_config = merge_session_config(s.config, event.session)
         try:
             candidate_config = self._sanitize_session_config(candidate_config, s.config)
+        except _VoiceValidationError as exc:
+            logger.warning("[realtime] Voice rejected session_id=%s param=%s", s.session_id, exc.param)
+            await self._send_error(
+                str(exc), exc.code, event_id=event.event_id if exc.client_event else None, param=exc.param
+            )
+            return
         except _UnsupportedAudioFormatError as exc:
             logger.warning("[realtime] Audio format rejected session_id=%s reason=%s", s.session_id, exc)
             await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
@@ -316,6 +360,7 @@ class OpenAIFullDuplexConnection:
 
         audio_output = audio.output
         if audio_output is not None:
+            audio_output.voice = self._validate_voice(audio_output.voice, "session.audio.output.voice")
             if audio_output.speed not in (None, 1):
                 previous_output = previous.audio.output if previous.audio is not None else None
                 audio_output.speed = previous_output.speed if previous_output is not None else None
@@ -728,6 +773,8 @@ class OpenAIFullDuplexConnection:
 
     def _resolve_response(self, response_cfg: Any) -> _ResolvedResponse:
         s = self.session
+        # Snapshot the fallback too: prompt rebuilds must not reread a newer session voice.
+        voice = s.output_voice
         tools, tool_choice = self._resolve_tools_and_choice(s, response_cfg)
         modalities = s.config.output_modalities
         max_output_tokens = s.config.max_output_tokens
@@ -749,6 +796,8 @@ class OpenAIFullDuplexConnection:
             if unsupported is not None:
                 raise ValueError(f"{unsupported} is not supported")
             output = getattr(audio, "output", None) if audio is not None else None
+            if output is not None:
+                voice = self._validate_voice(getattr(output, "voice", None), "response.audio.output.voice") or voice
             if output is not None and not self._is_pcm16_24khz_format(getattr(output, "format", None)):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
 
@@ -781,6 +830,7 @@ class OpenAIFullDuplexConnection:
             tool_choice=tool_choice,
             metadata=metadata,
             input_item_id=input_item_id,
+            voice=voice,
         )
 
     async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
@@ -801,6 +851,7 @@ class OpenAIFullDuplexConnection:
                     tools=response.tools,
                     instructions=response.instructions,
                     items=current_items,
+                    voice=response.voice,
                     skip_mm_cache=True,
                 )
             except VLLMValidationError as exc:
@@ -879,6 +930,12 @@ class OpenAIFullDuplexConnection:
 
         try:
             response = self._resolve_response(response_cfg)
+        except _VoiceValidationError as exc:
+            logger.warning("[realtime] Voice rejected session_id=%s param=%s", s.session_id, exc.param)
+            await self._send_error(
+                str(exc), exc.code, event_id=event.event_id if exc.client_event else None, param=exc.param
+            )
+            return
         except _UnsupportedAudioFormatError as exc:
             await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
             return
@@ -921,6 +978,7 @@ class OpenAIFullDuplexConnection:
                 tools=response.tools,
                 instructions=response.instructions,
                 items=preflight_items,
+                voice=response.voice,
             )
         except VLLMValidationError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -1268,6 +1326,13 @@ class OpenAIFullDuplexConnection:
 
         sampling_params_list = self.chat_handler._fix_minicpmo45_audio_stream_output_kinds(
             sampling_params_list, modalities
+        )
+        logger.debug(
+            "[realtime] generation submission session_id=%s request_id=%s response_id=%s speaker=%.128s",
+            s.session_id,
+            active.request_id,
+            response_id,
+            response.voice or "<model default>",
         )
         gen = self.engine.generate(
             prompt=engine_input,
@@ -1955,6 +2020,7 @@ class OpenAIFullDuplexConnection:
         *,
         instructions: str | None = None,
         items: list[types.ConversationItem] | None = None,
+        voice: str | None = None,
         skip_mm_cache: bool = False,
     ) -> EngineInput:
         """Render the effective conversation through normal chat preprocessing."""
@@ -2035,6 +2101,13 @@ class OpenAIFullDuplexConnection:
         )
         if engine_input.get("prompt_token_ids") is None:
             raise RuntimeError("Realtime renderer did not return prompt token IDs")
+        # Speaker selection belongs to this response, not reusable renderer state.
+        engine_input = engine_input.copy()
+        additional_information = engine_input.get("additional_information")
+        if isinstance(additional_information, dict):
+            engine_input["additional_information"] = additional_information.copy()
+            engine_input["additional_information"].pop("speaker", None)
+        set_prompt_speaker(engine_input, voice)
         return engine_input
 
     # ------------------------------------------------------------------ #
@@ -2169,16 +2242,17 @@ class OpenAIFullDuplexConnection:
     async def _send_error(
         self,
         message: str,
-        code: str = "server_error",
+        code: str | None = "server_error",
         event_id: str | None = None,
         *,
         error_type: str = "invalid_request_error",
+        param: str | None = None,
     ) -> None:
         error_data: dict[str, Any] = {
             "type": error_type,
             "code": code,
             "message": message,
-            "param": None,
+            "param": param,
             "event_id": event_id,
         }
         await self._send_event(

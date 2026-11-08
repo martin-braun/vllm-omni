@@ -7,6 +7,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import wave
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 from openai.types import realtime as types
+from pydantic import ValidationError
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -115,7 +117,11 @@ def _make_connection(
     chat_handler: Any = None,
 ) -> tuple[OpenAIFullDuplexConnection, _FakeRenderer]:
     renderer = _FakeRenderer()
-    model_config = SimpleNamespace(max_model_len=max_model_len, multimodal_config=None)
+    model_config = SimpleNamespace(
+        max_model_len=max_model_len,
+        multimodal_config=None,
+        hf_config={"talker_config": {"speaker_id": {"chelsie": 2301, "ethan": 2302, "aiden": 2303}}},
+    )
 
     async def preprocess_chat(request: Any, messages: list[dict[str, Any]], **kwargs: Any):
         tok_params = request.build_tok_params(model_config)
@@ -213,6 +219,234 @@ def _websocket_events(websocket: _FakeWebSocket) -> list[dict[str, Any]]:
     return [json.loads(message) for message in websocket.messages]
 
 
+@pytest.mark.asyncio
+async def test_session_voice_normalization_partial_updates_and_null():
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    assert connection.session.output_voice is None
+    updates = [
+        ({"audio": {"output": {"voice": " Chelsie "}}}, "chelsie"),
+        ({"instructions": "Keep it brief"}, "chelsie"),
+        ({"audio": {"output": {"format": {"type": "audio/pcm", "rate": 24000}}}}, "chelsie"),
+        ({"audio": {"output": {"voice": None}}}, None),
+        ({"audio": {"output": {"voice": "ETHAN"}}}, "ethan"),
+        ({"audio": {"output": {"voice": "  "}}}, None),
+    ]
+    for update, expected in updates:
+        event = types.SessionUpdateEvent.model_validate(
+            {"type": "session.update", "session": {"type": "realtime", **update}}
+        )
+        await connection._handle_session_update(event)
+        assert connection.session.output_voice == expected
+        ack = _websocket_events(websocket)[-1]
+        assert ack["type"] == "session.updated"
+        assert ack["session"]["audio"]["output"].get("voice") == expected
+
+
+@pytest.mark.parametrize(
+    ("response_config", "expected"),
+    [
+        (None, "chelsie"),
+        ({}, "chelsie"),
+        ({"audio": None}, "chelsie"),
+        ({"audio": {"output": None}}, "chelsie"),
+        ({"audio": {"output": {"voice": None}}}, "chelsie"),
+        ({"audio": {"output": {"voice": "  "}}}, "chelsie"),
+        ({"audio": {"output": {"voice": " AIDEN "}}}, "aiden"),
+        ({"audio": {"output": {"voice": "ETHAN"}}}, "ethan"),
+    ],
+)
+def test_response_voice_precedence_and_snapshot(response_config, expected):
+    connection, _ = _make_connection()
+    connection.session.config.audio.output.voice = "chelsie"
+    event = types.ResponseCreateEvent.model_validate({"type": "response.create", "response": response_config})
+    response = connection._resolve_response(event.response)
+    assert response.voice == expected
+    assert connection.session.output_voice == "chelsie"
+    assert connection._resolve_response(None).voice == "chelsie"
+    connection.session.config.audio.output.voice = "ethan"
+    assert response.voice == expected
+    other_connection, _ = _make_connection()
+    assert other_connection._resolve_response(None).voice is None
+
+
+def test_voice_without_checkpoint_enumeration_is_normalized():
+    engine = SimpleNamespace(model_config=SimpleNamespace(hf_config={}, max_model_len=100))
+    connection, _ = _make_connection(engine=engine)
+    event = types.ResponseCreateEvent.model_validate(
+        {"type": "response.create", "response": {"audio": {"output": {"voice": " Another Voice "}}}}
+    )
+    assert connection._resolve_response(event.response).voice == "another voice"
+
+
+def test_speaker_discovery_failure_logs_traceback(mocker, caplog, monkeypatch):
+    logger = logging.getLogger(f"{__name__}.discovery")
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.realtime.connection.logger", logger)
+    caplog.set_level(logging.WARNING, logger=logger.name)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.realtime.connection.get_supported_speakers_from_hf_config",
+        side_effect=RuntimeError("config unavailable"),
+    )
+    connection, _ = _make_connection()
+    assert connection._supported_speakers == set()
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is not None
+    assert "Could not load supported speakers" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["session.update", "response.create"])
+async def test_custom_voice_reference_uses_voice_id_error_without_mutating_state(event_type):
+    websocket = _FakeWebSocket()
+    connection, renderer = _make_connection(websocket=websocket)
+    connection.session.config.audio.output.voice = "chelsie"
+    accepted = connection.session.config
+    active = ActiveResponse(response_id="active", request_id="active-request")
+    connection.session.active_response = active
+    config = {"audio": {"output": {"voice": {"id": "voice_1234"}}}}
+    try:
+        if event_type == "session.update":
+            event = types.SessionUpdateEvent.model_validate(
+                {"type": event_type, "event_id": "custom-voice", "session": {"type": "realtime", **config}}
+            )
+        else:
+            event = types.ResponseCreateEvent.model_validate(
+                {"type": event_type, "event_id": "custom-voice", "response": config}
+            )
+    except ValidationError:
+        pytest.skip("Installed OpenAI SDK cannot represent custom voice references")
+    await connection._dispatch_event(event)
+    assert connection.session.config is accepted
+    assert connection.session.output_voice == "chelsie"
+    assert connection.session.active_response is active
+    assert not connection._response_cancel_event.is_set()
+    assert not renderer.engine_inputs
+    assert connection._connected
+    events = _websocket_events(websocket)
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    error = events[0]["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["message"] == "No voice found with id 'voice_1234'."
+    assert error["param"] == "voice_id"
+    assert error.get("code") is None
+    assert error.get("event_id") is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_response_voice_leaves_active_response_intact():
+    websocket = _FakeWebSocket()
+    connection, renderer = _make_connection(websocket=websocket)
+    connection.session.config.audio.output.voice = "chelsie"
+    active = ActiveResponse(response_id="active", request_id="active-request")
+    connection.session.active_response = active
+    event = types.ResponseCreateEvent.model_validate(
+        {
+            "type": "response.create",
+            "event_id": "bad-voice",
+            "response": {"audio": {"output": {"voice": "unknown"}}},
+        }
+    )
+    await connection._handle_response_create(event)
+    assert connection.session.active_response is active
+    assert connection.session.output_voice == "chelsie"
+    assert connection._response_task is None
+    assert not connection._response_cancel_event.is_set()
+    assert not renderer.engine_inputs
+    assert connection._connected
+    error = _websocket_events(websocket)[0]["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_value"
+    assert error["param"] == "response.audio.output.voice"
+    assert error["event_id"] == "bad-voice"
+
+
+@pytest.mark.asyncio
+async def test_voice_reaches_generation_without_changing_modalities(caplog, monkeypatch):
+    logger = logging.getLogger(f"{__name__}.speaker")
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.realtime.connection.logger", logger)
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(max_model_len=1000, websocket=websocket)
+    connection.engine.default_sampling_params_list = []
+    submitted = []
+
+    async def generate(**kwargs):
+        submitted.append(kwargs)
+        yield SimpleNamespace(final_output_type="text", outputs=[])
+
+    connection.engine.generate = generate
+    connection.session.config.audio.output.voice = "chelsie"
+    for voice, expected in [("aiden", "aiden"), (None, "chelsie")]:
+        event = types.ResponseCreateEvent.model_validate(
+            {
+                "type": "response.create",
+                "response": {"output_modalities": ["text"], "audio": {"output": {"voice": voice}}},
+            }
+        )
+        await connection._handle_response_create(event)
+        await connection._response_task
+        assert submitted[-1]["prompt"]["additional_information"]["speaker"] == [expected]
+        assert submitted[-1]["output_modalities"] == ["text"]
+    assert len(submitted) == 2
+    assert connection.session.output_voice == "chelsie"
+    assert not any(event["type"].startswith("response.output_audio") for event in _websocket_events(websocket))
+    submission_logs = [
+        record.getMessage() for record in caplog.records if "generation submission" in record.getMessage()
+    ]
+    assert len(submission_logs) == 2
+    assert f"session_id={connection.session.session_id}" in submission_logs[0]
+    assert f"request_id={submitted[0]['request_id']}" in submission_logs[0]
+    assert "response_id=resp_" in submission_logs[0]
+    assert submission_logs[0].endswith("speaker=aiden")
+    assert submission_logs[1].endswith("speaker=chelsie")
+
+
+@pytest.mark.asyncio
+async def test_voice_does_not_leak_through_reused_renderer_metadata(mocker):
+    connection, _ = _make_connection()
+    cached_prompt = {"prompt_token_ids": [1], "additional_information": {"language": ["de"]}}
+    mocker.patch.object(connection.chat_handler, "_preprocess_chat", return_value=([], [cached_prompt]))
+    chelsie = await connection._build_full_prompt(voice="chelsie")
+    aiden = await connection._build_full_prompt(voice="aiden")
+    default = await connection._build_full_prompt()
+    assert chelsie["additional_information"] == {"language": ["de"], "speaker": ["chelsie"]}
+    assert aiden["additional_information"] == {"language": ["de"], "speaker": ["aiden"]}
+    assert default["additional_information"] == {"language": ["de"]}
+    assert cached_prompt["additional_information"] == {"language": ["de"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [None, "aiden"])
+async def test_voice_snapshot_survives_truncation_and_cancellation_rebuild(mocker, override):
+    websocket = _FakeWebSocket()
+    connection, renderer = _make_connection(websocket=websocket)
+    connection.session.config.audio.output.voice = "chelsie"
+    connection.session.insert_item(_message_item("first"))
+    connection.session.insert_item(_message_item("second"))
+    connection.session.active_response = ActiveResponse(response_id="old", request_id="old-request")
+
+    async def cancel():
+        connection.session.active_response = None
+        connection.session.config.audio.output.voice = "ethan"
+
+    mocker.patch.object(connection, "_cancel_active_response", side_effect=cancel)
+    build_prompt = mocker.spy(connection, "_build_full_prompt")
+    run_response = mocker.patch.object(connection, "_run_response")
+    event = types.ResponseCreateEvent.model_validate(
+        {"type": "response.create", "response": {"audio": {"output": {"voice": override}}}}
+    )
+    await connection._handle_response_create(event)
+    await connection._response_task
+    expected = override or "chelsie"
+    assert renderer.skip_mm_cache == [True, True, True, True, False]
+    assert all(call.kwargs["voice"] == expected for call in build_prompt.call_args_list)
+    run_response.assert_awaited_once()
+    assert run_response.call_args.args[1].voice == expected
+    assert run_response.call_args.args[2]["additional_information"]["speaker"] == [expected]
+    assert connection.session.output_voice == "ethan"
+
+
 def _prompt_texts(conversation: list[dict[str, Any]]) -> list[str]:
     texts: list[str] = []
     for message in conversation:
@@ -270,7 +504,7 @@ async def test_preflight_truncates_by_rendered_token_count() -> None:
     assert all(params.max_output_tokens == 0 for params in renderer.tokenization_params)
     assert items == [first, second]
     assert prompt_items == [second]
-    assert engine_input is renderer.engine_inputs[-1]
+    assert engine_input == renderer.engine_inputs[-1]
 
 
 @pytest.mark.asyncio

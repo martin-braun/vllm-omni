@@ -107,6 +107,13 @@ class AudioFullDuplexSessionState:
     input_audio_buffer: bytearray = field(default_factory=bytearray)
     active_response: ActiveResponse | None = None
 
+    @property
+    def output_voice(self) -> str | None:
+        audio = self.config.audio
+        output = audio.output if audio is not None else None
+        voice = output.voice if output is not None else None
+        return voice if isinstance(voice, str) and voice.strip() else None
+
     def find_item_index(self, item_id: str) -> int | None:
         for i, item in enumerate(self.items):
             if item.id == item_id:

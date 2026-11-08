@@ -1005,8 +1005,10 @@ class Qwen3OmniMoeForConditionalGeneration(
     def _get_text_spk_token_id(self, voice_type: str) -> int:
         """Get speaker token ID for voice type."""
         if voice_type not in self.tts_text_spk_token_ids:
-            return self.tts_text_spk_token_ids[self.default_tts_text_spk_type]
-        return self.tts_text_spk_token_ids[voice_type]
+            voice_type = self.default_tts_text_spk_type
+        speaker_id = self.tts_text_spk_token_ids[voice_type]
+        logger.debug("[talker] speaker=%s speaker_token=%d", voice_type, speaker_id)
+        return speaker_id
 
     def talker_postprocess(self, hidden_states: torch.Tensor, **info_dict: object):
         """

@@ -36,3 +36,14 @@ def validate_requested_speaker(speaker: str | None, supported_speakers: set[str]
     if supported_speakers and normalized not in supported_speakers:
         raise ValueError(f"Invalid speaker '{speaker}'. Supported: {', '.join(sorted(supported_speakers))}")
     return normalized
+
+
+def set_prompt_speaker(prompt: dict[str, Any], speaker: str | None) -> None:
+    """Attach a selected speaker in the engine's list-valued metadata format."""
+    if not speaker:
+        return
+    additional_information = prompt.get("additional_information")
+    if not isinstance(additional_information, dict):
+        additional_information = {}
+        prompt["additional_information"] = additional_information
+    additional_information["speaker"] = [speaker]

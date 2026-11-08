@@ -10,6 +10,7 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
     validate_requested_speaker,
 )
 
@@ -55,6 +56,30 @@ def test_validate_requested_speaker_skips_validation_when_supported_empty():
 def test_get_supported_speakers_from_hf_config_uses_spk_id_fallback(mocker: MockerFixture):
     hf_config = _make_hf_config(mocker, speaker_id=None, spk_id={"Serena": 0})
     assert get_supported_speakers_from_hf_config(hf_config) == {"serena"}
+
+
+@pytest.mark.parametrize("speaker_key", ["speaker_id", "spk_id"])
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_speaker_discovery_accepts_checkpoint_config_forms(speaker_key, as_dict):
+    talker = {speaker_key: {"Chelsie": 2301, "Ethan": 2302, "Aiden": 2303}}
+    config = {"talker_config": talker} if as_dict else SimpleNamespace(talker_config=SimpleNamespace(**talker))
+    assert get_supported_speakers_from_hf_config(config) == {"chelsie", "ethan", "aiden"}
+
+
+@pytest.mark.parametrize("additional_information", [None, "unused", {"language": ["de"]}])
+def test_prompt_speaker_preserves_other_metadata(additional_information):
+    prompt = {"prompt_token_ids": [1], "additional_information": additional_information}
+    set_prompt_speaker(prompt, "chelsie")
+    assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    if isinstance(additional_information, dict):
+        assert prompt["additional_information"]["language"] == ["de"]
+
+
+@pytest.mark.parametrize("speaker", [None, ""])
+def test_default_speaker_does_not_add_prompt_metadata(speaker):
+    prompt = {"prompt_token_ids": [1]}
+    set_prompt_speaker(prompt, speaker)
+    assert prompt == {"prompt_token_ids": [1]}
 
 
 def test_get_supported_speakers_caches_normalized_keys(mocker: MockerFixture, serving_chat):

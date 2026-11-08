@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.openai.realtime.connection import (
     SAMPLE_RATE_HZ,
     OpenAIFullDuplexConnection,
 )
+from vllm_omni.entrypoints.openai.realtime.session import ActiveResponse
 from vllm_omni.entrypoints.transcription import SameModelTranscriber, TranscriptionStage
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -278,6 +279,61 @@ async def test_chunked_recognition_keeps_one_realtime_item_and_one_terminal_resu
     assert not connection._transcription_tasks
     assert connection.response_creates == []
     assert connection.session.active_response is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_voice_update_preserves_transcription_vad_and_active_response():
+    websocket = _FakeWebSocket()
+    connection = _make_connection(websocket)
+    connection._supported_speakers = {"chelsie", "ethan", "aiden"}
+    transcriber = _FakeTranscriber()
+    await _enable_transcription(connection, transcriber)
+    await connection._handle_session_update(
+        _session_update_event({"type": "server_vad", "create_response": False, "interrupt_response": False})
+    )
+    await connection._handle_session_update(
+        types.SessionUpdateEvent.model_validate(
+            {"type": "session.update", "session": {"type": "realtime", "audio": {"output": {"voice": "Chelsie"}}}}
+        )
+    )
+    accepted = connection.session.config
+    assert accepted.audio.input.transcription.model == "test-model"
+    assert accepted.audio.input.transcription.language == "de"
+    detector = connection._turn_detector
+    detector_config = detector.config
+    connection.session.active_response = active = ActiveResponse(response_id="active", request_id="request")
+    connection.session.input_audio_buffer.extend(b"\x01\x02")
+    websocket.messages.clear()
+    await connection._handle_session_update(
+        types.SessionUpdateEvent.model_validate(
+            {
+                "type": "session.update",
+                "event_id": "bad-voice",
+                "session": {
+                    "type": "realtime",
+                    "audio": {
+                        "input": {"transcription": None, "turn_detection": None},
+                        "output": {"voice": "unknown"},
+                    },
+                },
+            }
+        )
+    )
+    assert connection.session.config is accepted
+    assert connection.session.output_voice == "chelsie"
+    assert connection._turn_detector is detector
+    assert detector.config == detector_config
+    assert not detector.config.create_response
+    assert not detector.config.interrupt_response
+    assert connection.session.active_response is active
+    assert connection.session.input_audio_buffer == b"\x01\x02"
+    assert connection._connected
+    assert len(websocket.messages) == 1
+    error = json.loads(websocket.messages[0])["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_value"
+    assert error["param"] == "session.audio.output.voice"
+    assert error["event_id"] == "bad-voice"
 
 
 @pytest.mark.asyncio
